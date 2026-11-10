@@ -32,6 +32,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor          # [MỚI] cây quyết định đơn lẻ
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import make_scorer
@@ -84,6 +85,7 @@ print(f"Test : {test['Date'].min().date()} -> {test['Date'].max().date()}  ({len
 #     Fold 2: train dài thêm, kiểm định = cửa sổ 2 ... luôn "quá khứ -> tương lai"
 # ===========================================================================
 folds = []
+fold_labels = []      # nhãn tiếng Anh cho hình, ví dụ "Fold 1 (14 Feb – 27 Mar)"
 last_train_day = train["Date"].max()
 for k in range(N_FOLDS, 0, -1):
     val_end = last_train_day - pd.Timedelta(days=(k - 1) * VAL_DAYS)
@@ -94,6 +96,7 @@ for k in range(N_FOLDS, 0, -1):
     if len(tr_idx) > FIT_ROWS:
         tr_idx = np.sort(rng.choice(tr_idx, size=FIT_ROWS, replace=False))
     folds.append((tr_idx, va_idx))
+    fold_labels.append(f"Fold {len(folds)} ({val_start:%d %b} – {val_end:%d %b})")
     print(f"Fold {len(folds)}: kiểm định {val_start.date()} -> {val_end.date()}")
 
 # ===========================================================================
@@ -187,7 +190,13 @@ MODELS = {
         Ridge(),
         {P + "alpha": [0.1, 1, 10, 100]},
     ),
-    "Random Forest (cây quyết định)": (
+    # [MỚI] Một cây quyết định đơn lẻ. Dùng CÙNG lưới tham số với Random Forest
+    # để so sánh trực tiếp: 1 cây vs trung bình 40 cây.
+    "Decision Tree (cây quyết định)": (
+        DecisionTreeRegressor(random_state=SEED),
+        {P + "max_depth": [4, 8, 12, 16, 20], P + "min_samples_leaf": [5, 50]},
+    ),
+    "Random Forest (tập hợp cây)": (
         RandomForestRegressor(n_estimators=40, max_features=0.5, n_jobs=-1, random_state=SEED),
         {P + "max_depth": [4, 8, 12, 16, 20], P + "min_samples_leaf": [5, 50]},
     ),
@@ -234,22 +243,39 @@ for name, (model, grid) in MODELS.items():
         "_mae": -res.loc[i, "mean_test_MAE"],
     })
 
-    # Hình overfitting cho Random Forest: sai số theo độ sâu cây
-    if name.startswith("Random Forest"):
-        sub = res[res["param_" + P + "min_samples_leaf"] == 50]
-        depth = sub["param_" + P + "max_depth"].astype(int)
-        plt.figure(figsize=(6, 4))
-        plt.plot(depth, -sub["mean_train_MAE"], "o-", label="Train")
-        plt.errorbar(depth, -sub["mean_test_MAE"], yerr=sub["std_test_MAE"],
-                     fmt="o-", capsize=4, label="Kiểm định (± SD giữa các fold)")
-        plt.xlabel("max_depth (độ sâu tối đa của cây)")
-        plt.ylabel("MAE (EUR / cửa hàng / ngày)")
-        plt.title("Random Forest: sai số theo độ sâu (min_samples_leaf = 50)")
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("results/overfitting_random_forest.png", dpi=150)
-        plt.close()
+    # Hình overfitting cho Random Forest (bản đơn giản):
+    # chỉ vẽ min_samples_leaf của cấu hình được chọn -> 2 đường train / kiểm định,
+    # vùng tô giữa 2 đường = khoảng cách (overfit). Số liệu leaf còn lại xem bảng tuning.
+    if name.startswith(("Random Forest", "Decision Tree")):     # [SỬA] vẽ cho cả 2 mô hình cây
+        short = name.split(" (")[0]                              # "Random Forest" / "Decision Tree"
+        leaf_col, depth_col = "param_" + P + "min_samples_leaf", "param_" + P + "max_depth"
+        best_leaf = best_params[name][P + "min_samples_leaf"]
+        best_depth = best_params[name][P + "max_depth"]
+        sub = res[res[leaf_col] == best_leaf].sort_values(depth_col)
+        depth = sub[depth_col].astype(int).to_numpy()
+        train_mae = -sub["mean_train_MAE"].to_numpy()
+        val_mae = -sub["mean_test_MAE"].to_numpy()
+        k = list(depth).index(best_depth)                 # vị trí cấu hình được chọn
+
+        fig, ax = plt.subplots(figsize=(7, 4.2))
+        ax.plot(depth, train_mae, "o--", color="tab:gray", label="Train")
+        ax.plot(depth, val_mae, "o-", color="tab:blue", lw=2, label="Validation")
+        ax.fill_between(depth, train_mae, val_mae, where=val_mae > train_mae, interpolate=True,
+                        color="tab:blue", alpha=0.12, label="Gap (overfitting)")
+        ax.scatter(best_depth, val_mae[k], s=200, marker="*", color="tab:red", zorder=5,
+                   label=f"Selected (max_depth = {best_depth})")
+        ax.annotate(f"gap = {val_mae[k] - train_mae[k]:.0f} EUR",
+                    xy=(best_depth, (val_mae[k] + train_mae[k]) / 2),
+                    xytext=(-12, 0), textcoords="offset points", ha="right", va="center")
+        ax.set_xticks(depth)
+        ax.set_xlabel("max_depth (maximum tree depth)")
+        ax.set_ylabel("MAE (EUR per store per day)")
+        ax.set_title(f"{short}: train vs. validation error (min_samples_leaf = {best_leaf})")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(f"results/overfitting_{short.lower().replace(' ', '_')}.png", dpi=150)
+        plt.close(fig)
 
 # Bảng so sánh: baseline vs 3 họ mô hình (trên kiểm định, KHÔNG phải test)
 cv_rows.insert(0, {
@@ -268,16 +294,35 @@ cv_table.drop(columns="_mae").to_csv("results/cv_comparison.csv", index=False)
 best_name = cv_table.iloc[1:].sort_values("_mae").iloc[0]["Mô hình"]
 print("\n>>> Mô hình được chọn (theo kiểm định):", best_name)
 
-# Hình: MAE từng fold của từng mô hình
-plt.figure(figsize=(7, 4))
-plt.boxplot(list(fold_mae.values()))
-plt.xticks(range(1, len(fold_mae) + 1), [n.split(" (")[0] for n in fold_mae], rotation=15)
-plt.ylabel("MAE kiểm định (EUR / cửa hàng / ngày)")
-plt.title(f"Sai số trên {N_FOLDS} fold rolling-origin")
-plt.grid(alpha=0.3)
-plt.tight_layout()
-plt.savefig("results/cv_boxplot.png", dpi=150)
-plt.close()
+# Lưu MAE từng fold ra file (để báo cáo và vẽ lại hình mà không cần chạy lại)
+fold_df = pd.DataFrame(fold_mae, index=fold_labels)
+fold_df.columns = [n.split(" (")[0] for n in fold_df.columns]
+fold_df.round(1).to_csv("results/cv_fold_mae.csv")
+
+# Hình: dot plot — mỗi chấm là MAE của 1 fold, hình thoi đen là trung bình ± SD.
+# (Boxplot không hợp với chỉ 3 giá trị; dot plot cho thấy từng fold.)
+models = list(fold_df.columns)
+fold_colors = plt.cm.Blues(np.linspace(0.45, 0.9, N_FOLDS))
+fig, ax = plt.subplots(figsize=(8, 4.2))
+for j, m in enumerate(models):
+    vals = fold_df[m].to_numpy()
+    for f, v in enumerate(vals):
+        ax.scatter(v, j + (f - (N_FOLDS - 1) / 2) * 0.12, color=fold_colors[f], s=50, zorder=2,
+                   label=fold_labels[f] if j == 0 else None)
+    ax.errorbar(vals.mean(), j, xerr=vals.std(), fmt="D", color="black", capsize=5, zorder=3,
+                label="Mean ± SD across folds" if j == 0 else None)
+    ax.text(vals.mean(), j - 0.3, f"{vals.mean():,.0f}", ha="center", fontsize=9)
+ax.axvline(fold_df[models[0]].mean(), ls="--", color="gray", lw=1, label="Baseline mean")
+ax.set_yticks(range(len(models)))
+ax.set_yticklabels(models)
+ax.set_ylim(len(models) - 0.5, -0.6)          # Baseline ở trên cùng
+ax.set_xlabel("Validation MAE (EUR per store per day)")
+ax.set_title(f"Validation error on {N_FOLDS} rolling-origin folds")
+ax.legend(fontsize=8, loc="lower right")
+ax.grid(alpha=0.3, axis="x")
+fig.tight_layout()
+fig.savefig("results/cv_folds.png", dpi=150)
+plt.close(fig)
 
 # ===========================================================================
 # B8. ĐÁNH GIÁ TRÊN TẬP TEST (CHỈ MỞ 1 LẦN)
@@ -311,12 +356,12 @@ print(f"\n{best_name}: MAE {best_mae:,.0f} EUR so với baseline {base_mae:,.0f}
 store_id = test["Store"].iloc[0]
 s = test["Store"] == store_id
 plt.figure(figsize=(8, 4))
-plt.plot(test.loc[s, "Date"], y_test[s], "o-", label="Thực tế")
+plt.plot(test.loc[s, "Date"], y_test[s], "o-", label="Actual")
 plt.plot(test.loc[s, "Date"], pred_test[s], "s--", label=best_name.split(" (")[0])
 plt.plot(test.loc[s, "Date"], baseline_predict(X_test[s]), ":", label="Baseline")
-plt.xlabel("Ngày")
-plt.ylabel("Doanh số (EUR)")
-plt.title(f"Cửa hàng {store_id}: thực tế vs dự báo trên tập test")
+plt.xlabel("Date")
+plt.ylabel("Daily sales (EUR)")
+plt.title(f"Store {store_id}: actual vs. forecast on the test set")
 plt.legend()
 plt.grid(alpha=0.3)
 plt.gcf().autofmt_xdate()
@@ -344,8 +389,8 @@ imp_table.round(2).to_csv("results/feature_importance.csv", index=False)
 top = imp_table.head(10).iloc[::-1]
 plt.figure(figsize=(7, 4.5))
 plt.barh(top["Đặc trưng"], top["MAE tăng khi xáo trộn (EUR)"])
-plt.xlabel("MAE tăng khi xáo trộn đặc trưng (EUR)")
-plt.title(f"Độ quan trọng đặc trưng - {best_name.split(' (')[0]}")
+plt.xlabel("Increase in MAE when the feature is shuffled (EUR)")
+plt.title(f"Permutation importance – {best_name.split(' (')[0]} (top 10 features)")
 plt.grid(alpha=0.3, axis="x")
 plt.tight_layout()
 plt.savefig("results/feature_importance.png", dpi=150)
@@ -358,5 +403,6 @@ test_err["err"] = pred_test - y_test
 for col in ["StoreType", "Promo", "DayOfWeek"]:
     g = test_err.groupby(col).agg(MAE=("abs_err", "mean"), Bias=("err", "mean"), so_dong=("err", "size"))
     print(f"\nSai số theo {col}:\n", g.round(0).to_string())
+    g.round(1).to_csv(f"results/error_by_{col}.csv")       # lưu lại để đưa vào báo cáo
 
 print("\nXong. Bảng và hình nằm trong thư mục results/")
